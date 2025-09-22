@@ -11,11 +11,9 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Supabase configuration (REQUIRED) - Temporary hardcoded for testing
-const supabaseUrl = "https://fsicauceosmdrhxmvreu.supabase.co";
-const supabaseServiceKey =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZzaWNhdWNlb3NtZHJoeG12cmV1Iiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc1ODEwMjk5OSwiZXhwIjoyMDczNjc4OTk5fQ.bqzxqGvx_l8-PQ4Ms5fgorweqQCn8fWaBF1O8fs8lX0"; // Replace with your actual key
-const supabaseAnonKey =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZzaWNhdWNlb3NtZHJoeG12cmV1Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTgxMDI5OTksImV4cCI6MjA3MzY3ODk5OX0.J_Dx9SLkzffTFcDhxMix56cmtpM4710nqafnyP5BLhk"; // Replace with your actual key
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY; // Replace with your actual key
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY; // Replace with your actual key
 
 // Validate required environment variables
 if (
