@@ -1,76 +1,111 @@
-const express = require('express');
-const cors = require('cors');
-const { Pool } = require('pg');
-const Joi = require('joi');
-const math = require('mathjs');
-const ss = require('simple-statistics');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
-const validator = require('validator');
-require('dotenv').config();
+const express = require("express");
+const cors = require("cors");
+const { Pool } = require("pg");
+const Joi = require("joi");
+const math = require("mathjs");
+const ss = require("simple-statistics");
+const validator = require("validator");
+require("dotenv").config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// JWT Secret (add this to your .env file)
-const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-in-production';
+// Supabase configuration (REQUIRED) - Temporary hardcoded for testing
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY; // Replace with your actual key
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY; // Replace with your actual key
+
+// Validate required environment variables
+if (
+  !supabaseUrl ||
+  !supabaseServiceKey ||
+  !supabaseAnonKey ||
+  supabaseUrl === "your_actual_supabase_url_here" ||
+  supabaseServiceKey === "your_actual_service_role_key_here"
+) {
+  console.error("❌ FATAL ERROR: Supabase configuration is required!");
+  console.error("");
+  console.error("Please configure the following environment variables:");
+  console.error("  SUPABASE_URL=your_supabase_project_url");
+  console.error("  SUPABASE_SERVICE_ROLE_KEY=your_service_role_key");
+  console.error("  SUPABASE_ANON_KEY=your_anon_key");
+  console.error("");
+  console.error(
+    "Get these values from: https://app.supabase.com/project/YOUR_PROJECT/settings/api"
+  );
+  process.exit(1);
+}
+
+// Initialize Supabase clients
+let supabaseAdmin = null;
+let supabase = null;
+
+try {
+  const { createClient } = require("@supabase/supabase-js");
+  supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey);
+  supabase = createClient(supabaseUrl, supabaseAnonKey);
+  console.log("✅ Supabase clients initialized successfully");
+} catch (error) {
+  console.error(
+    "❌ FATAL ERROR: Failed to initialize Supabase:",
+    error.message
+  );
+  process.exit(1);
+}
 
 // Middleware
-app.use(cors({
-  origin: ['http://localhost:3000', 'http://127.0.0.1:3000'],
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
+app.use(
+  cors({
+    origin: ["http://localhost:3000", "http://127.0.0.1:3000"],
+    credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// PostgreSQL connection pool for Supabase
+// PostgreSQL connection pool
 const pool = new Pool({
-  host: 'db.fsicauceosmdrhxmvreu.supabase.co',
-  port: 5432,
-  user: 'postgres',
-  password: '3146',
-  database: 'postgres',
+  host: process.env.DB_HOST || "db.fsicauceosmdrhxmvreu.supabase.co",
+  port: process.env.DB_PORT || 5432,
+  user: process.env.DB_USER || "postgres",
+  password: process.env.DB_PASSWORD || "3146",
+  database: process.env.DB_NAME || "postgres",
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 10000,
-  ssl: false
+  ssl: false,
 });
 
 // Test database connection
-pool.on('connect', () => {
-  console.log('✅ Connected to PostgreSQL database');
+pool.on("connect", () => {
+  console.log("Connected to PostgreSQL database");
 });
 
-pool.on('error', (err) => {
-  console.error('❌ PostgreSQL connection error:', err);
+pool.on("error", (err) => {
+  console.error("PostgreSQL connection error:", err);
 });
 
 // Validation schemas
-const userSignupSchema = Joi.object({
-  email: Joi.string().email().required(),
-  password: Joi.string().min(6).required(),
-  firstName: Joi.string().min(2).max(50).required(),
-  lastName: Joi.string().min(2).max(50).required(),
-  phone: Joi.string().pattern(/^[0-9]{10}$/).optional(),
-  tradingExperience: Joi.string().valid('beginner', 'intermediate', 'advanced', 'professional').optional(),
+const userProfileSchema = Joi.object({
+  phone: Joi.string()
+    .pattern(/^[0-9]{10}$/)
+    .optional(),
+  tradingExperience: Joi.string()
+    .valid("beginner", "intermediate", "advanced", "professional")
+    .optional(),
   preferredMarket: Joi.string().optional(),
-  riskTolerance: Joi.string().valid('low', 'medium', 'high').optional()
-});
-
-const userSigninSchema = Joi.object({
-  email: Joi.string().email().required(),
-  password: Joi.string().required()
+  riskTolerance: Joi.string().valid("low", "medium", "high").optional(),
 });
 
 const tradeSchema = Joi.object({
-  gmail: Joi.string().email().required(),
-  status: Joi.string().valid('open', 'closed').required(),
+  gmail: Joi.string().optional(),
+  status: Joi.string().valid("open", "closed").required(),
   broker: Joi.string().required(),
   market: Joi.string().required(),
   instrument: Joi.string().required(),
-  direction: Joi.string().valid('buy', 'sell').required(),
+  direction: Joi.string().valid("buy", "sell").required(),
   qty: Joi.number().positive().required(),
   entry_price: Joi.number().positive().required(),
   exit_price: Joi.number().positive().optional(),
@@ -81,59 +116,98 @@ const tradeSchema = Joi.object({
   p_and_l: Joi.number().optional(),
   strategy: Joi.string().required(),
   setup: Joi.string().optional(),
-  reason: Joi.string().optional()
+  reason: Joi.string().optional(),
 });
 
-// Authentication middleware
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
-
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
+// Supabase Authentication middleware (REQUIRED)
+const authenticateSupabaseUser = async (req, res, next) => {
+  try {
+    const authHeader = req.headers["authorization"];
+    if (!authHeader) {
+      return res.status(401).json({
+        error: "Authentication required",
+        message: "Authorization header is missing",
+      });
     }
-    req.user = user;
+
+    const token = authHeader.split(" ")[1];
+    if (!token) {
+      return res.status(401).json({
+        error: "Authentication required",
+        message: "Bearer token is missing",
+      });
+    }
+
+    // Verify the JWT token with Supabase
+    const {
+      data: { user },
+      error,
+    } = await supabaseAdmin.auth.getUser(token);
+
+    if (error) {
+      console.error("Token verification error:", error);
+      return res.status(403).json({
+        error: "Authentication failed",
+        message: "Invalid or expired token",
+      });
+    }
+
+    if (!user) {
+      return res.status(403).json({
+        error: "Authentication failed",
+        message: "User not found",
+      });
+    }
+
+    // Attach user to request object
+    req.user = {
+      id: user.id,
+      email: user.email,
+      ...user.user_metadata,
+    };
+
     next();
-  });
+  } catch (error) {
+    console.error("Authentication middleware error:", error);
+    return res.status(500).json({
+      error: "Authentication service error",
+      message: "Failed to verify authentication",
+    });
+  }
 };
 
-// Create database tables on startup
+// Database initialization
 const initializeDatabase = async () => {
   try {
-    // Users table
-    const createUsersTableQuery = `
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        password_hash VARCHAR(255) NOT NULL,
-        first_name VARCHAR(100) NOT NULL,
-        last_name VARCHAR(100) NOT NULL,
+    console.log("Initializing database schema with Supabase auth...");
+
+    // User profiles table (references Supabase auth.users)
+    const createUserProfilesTableQuery = `
+      CREATE TABLE IF NOT EXISTS user_profiles (
+        user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
         phone VARCHAR(15),
-        trading_experience VARCHAR(20) CHECK (trading_experience IN ('beginner', 'intermediate', 'advanced', 'professional')),
+        trading_experience VARCHAR(20) CHECK (trading_experience IN ('beginner', 'intermediate', 'advanced', 'professional')) DEFAULT 'beginner',
         preferred_market VARCHAR(100),
-        risk_tolerance VARCHAR(10) CHECK (risk_tolerance IN ('low', 'medium', 'high')),
-        is_active BOOLEAN DEFAULT TRUE,
-        email_verified BOOLEAN DEFAULT FALSE,
-        last_login TIMESTAMP,
+        risk_tolerance VARCHAR(10) CHECK (risk_tolerance IN ('low', 'medium', 'high')) DEFAULT 'medium',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
-
-      CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
-      CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at);
     `;
 
-    // Trading journal table (enhanced)
+    await pool.query(createUserProfilesTableQuery);
+    console.log("✅ User profiles table created/verified");
+
+    // Create indexes for user_profiles table
+    await pool.query(
+      "CREATE INDEX IF NOT EXISTS idx_user_profiles_user_id ON user_profiles(user_id);"
+    );
+    console.log("✅ User profiles indexes created");
+
+    // Trading journal table (references Supabase auth.users)
     const createTradingTableQuery = `
       CREATE TABLE IF NOT EXISTS trading_journal (
         s_no SERIAL PRIMARY KEY,
-        id INTEGER REFERENCES users(user_id) ON DELETE CASCADE,
-        gmail VARCHAR(255) NOT NULL,
+        user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
         status VARCHAR(10) CHECK (status IN ('open', 'closed')) NOT NULL,
         broker VARCHAR(100) NOT NULL,
         market VARCHAR(100) NOT NULL,
@@ -153,446 +227,229 @@ const initializeDatabase = async () => {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
-
-      CREATE INDEX IF NOT EXISTS idx_trading_journal_user_id ON trading_journal(id);
-      CREATE INDEX IF NOT EXISTS idx_trading_journal_gmail ON trading_journal(gmail);
-      CREATE INDEX IF NOT EXISTS idx_trading_journal_status ON trading_journal(status);
-      CREATE INDEX IF NOT EXISTS idx_trading_journal_entry_dt ON trading_journal(entry_dt);
-      CREATE INDEX IF NOT EXISTS idx_trading_journal_strategy ON trading_journal(strategy);
-      CREATE INDEX IF NOT EXISTS idx_trading_journal_instrument ON trading_journal(instrument);
     `;
 
-    await pool.query(createUsersTableQuery);
     await pool.query(createTradingTableQuery);
-    console.log('✅ Database tables created successfully');
+    console.log("✅ Trading journal table created/verified");
+
+    // Create indexes for trading_journal table
+    await pool.query(
+      "CREATE INDEX IF NOT EXISTS idx_trading_journal_user_id ON trading_journal(user_id);"
+    );
+    await pool.query(
+      "CREATE INDEX IF NOT EXISTS idx_trading_journal_status ON trading_journal(status);"
+    );
+    console.log("✅ Trading journal indexes created");
+
+    // Enable Row Level Security
+    const enableRLSQuery = `
+      ALTER TABLE user_profiles ENABLE ROW LEVEL SECURITY;
+      ALTER TABLE trading_journal ENABLE ROW LEVEL SECURITY;
+    `;
+
+    await pool.query(enableRLSQuery);
+    console.log("✅ Row Level Security enabled");
+
+    // Create RLS policies
+    const rlsPoliciesQuery = `
+      -- User profiles policies
+      DROP POLICY IF EXISTS "Users can view own profile" ON user_profiles;
+      DROP POLICY IF EXISTS "Users can update own profile" ON user_profiles;
+      DROP POLICY IF EXISTS "Users can insert own profile" ON user_profiles;
+
+      CREATE POLICY "Users can view own profile" ON user_profiles
+        FOR SELECT USING (auth.uid() = user_id);
+
+      CREATE POLICY "Users can update own profile" ON user_profiles
+        FOR UPDATE USING (auth.uid() = user_id);
+
+      CREATE POLICY "Users can insert own profile" ON user_profiles
+        FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+      -- Trading journal policies
+      DROP POLICY IF EXISTS "Users can view own trades" ON trading_journal;
+      DROP POLICY IF EXISTS "Users can insert own trades" ON trading_journal;
+      DROP POLICY IF EXISTS "Users can update own trades" ON trading_journal;
+      DROP POLICY IF EXISTS "Users can delete own trades" ON trading_journal;
+
+      CREATE POLICY "Users can view own trades" ON trading_journal
+        FOR SELECT USING (auth.uid() = user_id);
+
+      CREATE POLICY "Users can insert own trades" ON trading_journal
+        FOR INSERT WITH CHECK (auth.uid() = user_id);
+
+      CREATE POLICY "Users can update own trades" ON trading_journal
+        FOR UPDATE USING (auth.uid() = user_id);
+
+      CREATE POLICY "Users can delete own trades" ON trading_journal
+        FOR DELETE USING (auth.uid() = user_id);
+    `;
+
+    await pool.query(rlsPoliciesQuery);
+    console.log("✅ RLS policies created");
+
+    console.log("✅ Database initialization completed successfully");
   } catch (error) {
-    console.error('❌ Database initialization error:', error);
+    console.error("❌ Database initialization error:", error);
     throw error;
   }
 };
 
-// Data Science Helper Functions (keep existing TradingAnalytics class)
-class TradingAnalytics {
-  static calculateSharpeRatio(returns, riskFreeRate = 0.02) {
-    if (returns.length < 2) return 0;
-    const excessReturns = returns.map(r => r - riskFreeRate / 252);
-    const avgExcessReturn = ss.mean(excessReturns);
-    const stdDev = ss.standardDeviation(excessReturns);
-    return stdDev === 0 ? 0 : (avgExcessReturn / stdDev) * Math.sqrt(252);
-  }
-
-  static calculateMaxDrawdown(cumulativePnL) {
-    if (cumulativePnL.length === 0) return 0;
-    let maxDrawdown = 0;
-    let peak = cumulativePnL[0];
-    
-    for (let i = 1; i < cumulativePnL.length; i++) {
-      if (cumulativePnL[i] > peak) {
-        peak = cumulativePnL[i];
-      }
-      const drawdown = (peak - cumulativePnL[i]) / Math.max(peak, 1);
-      if (drawdown > maxDrawdown) {
-        maxDrawdown = drawdown;
-      }
-    }
-    return maxDrawdown;
-  }
-
-  static calculateVaR(returns, confidence = 0.05) {
-    if (returns.length === 0) return 0;
-    const sortedReturns = returns.sort((a, b) => a - b);
-    const index = Math.floor(confidence * sortedReturns.length);
-    return sortedReturns[index] || 0;
-  }
-
-  static calculateCalmarRatio(annualReturn, maxDrawdown) {
-    return maxDrawdown === 0 ? 0 : annualReturn / maxDrawdown;
-  }
-
-  static calculateWinRate(trades) {
-    const closedTrades = trades.filter(t => t.status === 'closed' && t.p_and_l !== null);
-    if (closedTrades.length === 0) return 0;
-    const winningTrades = closedTrades.filter(t => t.p_and_l > 0);
-    return (winningTrades.length / closedTrades.length) * 100;
-  }
-
-  static calculateProfitFactor(trades) {
-    const closedTrades = trades.filter(t => t.status === 'closed' && t.p_and_l !== null);
-    const grossProfit = closedTrades.filter(t => t.p_and_l > 0).reduce((sum, t) => sum + t.p_and_l, 0);
-    const grossLoss = Math.abs(closedTrades.filter(t => t.p_and_l < 0).reduce((sum, t) => sum + t.p_and_l, 0));
-    return grossLoss === 0 ? (grossProfit > 0 ? Infinity : 0) : grossProfit / grossLoss;
-  }
-
-  static calculateExpectancy(trades) {
-    const closedTrades = trades.filter(t => t.status === 'closed' && t.p_and_l !== null);
-    if (closedTrades.length === 0) return 0;
-    
-    const winners = closedTrades.filter(t => t.p_and_l > 0);
-    const losers = closedTrades.filter(t => t.p_and_l < 0);
-    
-    const winRate = winners.length / closedTrades.length;
-    const lossRate = losers.length / closedTrades.length;
-    const avgWin = winners.length > 0 ? ss.mean(winners.map(t => t.p_and_l)) : 0;
-    const avgLoss = losers.length > 0 ? Math.abs(ss.mean(losers.map(t => t.p_and_l))) : 0;
-    
-    return (winRate * avgWin) - (lossRate * avgLoss);
-  }
-
-  static detectPatterns(trades) {
-    const patterns = {
-      consecutiveWins: 0,
-      consecutiveLosses: 0,
-      bestWinStreak: 0,
-      worstLossStreak: 0,
-      dayOfWeekPerformance: {},
-      hourlyPerformance: {},
-      instrumentPerformance: {},
-      strategyEffectiveness: {}
-    };
-
-    const closedTrades = trades.filter(t => t.status === 'closed' && t.p_and_l !== null)
-                             .sort((a, b) => new Date(a.exit_dt) - new Date(b.exit_dt));
-
-    let currentWinStreak = 0;
-    let currentLossStreak = 0;
-    let maxWinStreak = 0;
-    let maxLossStreak = 0;
-
-    closedTrades.forEach(trade => {
-      if (trade.p_and_l > 0) {
-        currentWinStreak++;
-        currentLossStreak = 0;
-        maxWinStreak = Math.max(maxWinStreak, currentWinStreak);
-      } else if (trade.p_and_l < 0) {
-        currentLossStreak++;
-        currentWinStreak = 0;
-        maxLossStreak = Math.max(maxLossStreak, currentLossStreak);
-      }
-    });
-
-    patterns.bestWinStreak = maxWinStreak;
-    patterns.worstLossStreak = maxLossStreak;
-
-    closedTrades.forEach(trade => {
-      const dayOfWeek = new Date(trade.exit_dt).getDay();
-      const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-      const dayName = dayNames[dayOfWeek];
-      
-      if (!patterns.dayOfWeekPerformance[dayName]) {
-        patterns.dayOfWeekPerformance[dayName] = { trades: 0, totalPnL: 0, winRate: 0 };
-      }
-      
-      patterns.dayOfWeekPerformance[dayName].trades++;
-      patterns.dayOfWeekPerformance[dayName].totalPnL += trade.p_and_l;
-    });
-
-    Object.keys(patterns.dayOfWeekPerformance).forEach(day => {
-      const dayTrades = closedTrades.filter(t => {
-        const dayOfWeek = new Date(t.exit_dt).getDay();
-        const dayNames = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-        return dayNames[dayOfWeek] === day;
-      });
-      const wins = dayTrades.filter(t => t.p_and_l > 0).length;
-      patterns.dayOfWeekPerformance[day].winRate = dayTrades.length > 0 ? (wins / dayTrades.length) * 100 : 0;
-    });
-
-    closedTrades.forEach(trade => {
-      if (!patterns.instrumentPerformance[trade.instrument]) {
-        patterns.instrumentPerformance[trade.instrument] = { 
-          trades: 0, 
-          totalPnL: 0, 
-          winRate: 0,
-          avgPnL: 0 
-        };
-      }
-      
-      patterns.instrumentPerformance[trade.instrument].trades++;
-      patterns.instrumentPerformance[trade.instrument].totalPnL += trade.p_and_l;
-    });
-
-    Object.keys(patterns.instrumentPerformance).forEach(instrument => {
-      const instrumentTrades = closedTrades.filter(t => t.instrument === instrument);
-      const wins = instrumentTrades.filter(t => t.p_and_l > 0).length;
-      patterns.instrumentPerformance[instrument].winRate = (wins / instrumentTrades.length) * 100;
-      patterns.instrumentPerformance[instrument].avgPnL = patterns.instrumentPerformance[instrument].totalPnL / instrumentTrades.length;
-    });
-
-    return patterns;
-  }
-}
-
-// USER AUTHENTICATION ROUTES
-
-// User Registration
-app.post('/api/auth/signup', async (req, res) => {
-  try {
-    // Validate input
-    const { error, value } = userSignupSchema.validate(req.body);
-    if (error) {
-      return res.status(400).json({
-        error: 'Validation Error',
-        details: error.details.map(detail => detail.message)
-      });
-    }
-
-    const { email, password, firstName, lastName, phone, tradingExperience, preferredMarket, riskTolerance } = value;
-
-    // Check if user already exists
-    const existingUser = await pool.query('SELECT email FROM users WHERE email = $1', [email]);
-    if (existingUser.rows.length > 0) {
-      return res.status(409).json({
-        error: 'User already exists',
-        message: 'An account with this email already exists'
-      });
-    }
-
-    // Hash password
-    const saltRounds = 12;
-    const passwordHash = await bcrypt.hash(password, saltRounds);
-
-    // Insert new user
-    const insertUserQuery = `
-      INSERT INTO users (
-        email, password_hash, first_name, last_name, phone, 
-        trading_experience, preferred_market, risk_tolerance
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      RETURNING user_id, email, first_name, last_name, phone, trading_experience, preferred_market, risk_tolerance, created_at
-    `;
-
-    const values = [
-      email, passwordHash, firstName, lastName, phone || null,
-      tradingExperience || 'beginner', preferredMarket || null, riskTolerance || 'medium'
-    ];
-
-    const result = await pool.query(insertUserQuery, values);
-    const newUser = result.rows[0];
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { 
-        userId: newUser.user_id, 
-        email: newUser.email,
-        firstName: newUser.first_name,
-        lastName: newUser.last_name
-      },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.status(201).json({
-      message: 'User created successfully',
-      token,
-      user: {
-        id: newUser.user_id,
-        email: newUser.email,
-        firstName: newUser.first_name,
-        lastName: newUser.last_name,
-        phone: newUser.phone,
-        tradingExperience: newUser.trading_experience,
-        preferredMarket: newUser.preferred_market,
-        riskTolerance: newUser.risk_tolerance,
-        createdAt: newUser.created_at
-      }
-    });
-  } catch (error) {
-    console.error('Error creating user:', error);
-    res.status(500).json({ 
-      error: 'Failed to create user',
-      message: error.message 
-    });
-  }
-});
-
-// User Login
-app.post('/api/auth/signin', async (req, res) => {
-  try {
-    // Validate input
-    const { error, value } = userSigninSchema.validate(req.body);
-    if (error) {
-      return res.status(400).json({
-        error: 'Validation Error',
-        details: error.details.map(detail => detail.message)
-      });
-    }
-
-    const { email, password } = value;
-
-    // Find user
-    const userQuery = `
-      SELECT user_id, email, password_hash, first_name, last_name, phone, 
-             trading_experience, preferred_market, risk_tolerance, is_active
-      FROM users 
-      WHERE email = $1
-    `;
-    
-    const userResult = await pool.query(userQuery, [email]);
-    
-    if (userResult.rows.length === 0) {
-      return res.status(401).json({
-        error: 'Invalid credentials',
-        message: 'Email or password is incorrect'
-      });
-    }
-
-    const user = userResult.rows[0];
-
-    if (!user.is_active) {
-      return res.status(401).json({
-        error: 'Account disabled',
-        message: 'Your account has been disabled. Please contact support.'
-      });
-    }
-
-    // Verify password
-    const isValidPassword = await bcrypt.compare(password, user.password_hash);
-    if (!isValidPassword) {
-      return res.status(401).json({
-        error: 'Invalid credentials',
-        message: 'Email or password is incorrect'
-      });
-    }
-
-    // Update last login
-    await pool.query('UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE user_id = $1', [user.user_id]);
-
-    // Generate JWT token
-    const token = jwt.sign(
-      { 
-        userId: user.user_id, 
-        email: user.email,
-        firstName: user.first_name,
-        lastName: user.last_name
-      },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.json({
-      message: 'Login successful',
-      token,
-      user: {
-        id: user.user_id,
-        email: user.email,
-        firstName: user.first_name,
-        lastName: user.last_name,
-        phone: user.phone,
-        tradingExperience: user.trading_experience,
-        preferredMarket: user.preferred_market,
-        riskTolerance: user.risk_tolerance
-      }
-    });
-  } catch (error) {
-    console.error('Error during login:', error);
-    res.status(500).json({ 
-      error: 'Login failed',
-      message: error.message 
-    });
-  }
-});
-
-// Get user profile (protected route)
-app.get('/api/auth/profile', authenticateToken, async (req, res) => {
-  try {
-    const userQuery = `
-      SELECT user_id, email, first_name, last_name, phone, 
-             trading_experience, preferred_market, risk_tolerance, created_at, last_login
-      FROM users 
-      WHERE user_id = $1
-    `;
-    
-    const result = await pool.query(userQuery, [req.user.userId]);
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    const user = result.rows[0];
-    res.json({
-      user: {
-        id: user.user_id,
-        email: user.email,
-        firstName: user.first_name,
-        lastName: user.last_name,
-        phone: user.phone,
-        tradingExperience: user.trading_experience,
-        preferredMarket: user.preferred_market,
-        riskTolerance: user.risk_tolerance,
-        createdAt: user.created_at,
-        lastLogin: user.last_login
-      }
-    });
-  } catch (error) {
-    console.error('Error fetching profile:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch profile',
-      message: error.message 
-    });
-  }
-});
-
-// Token validation
-app.post('/api/auth/validate-token', authenticateToken, (req, res) => {
-  res.json({
-    valid: true,
-    user: {
-      id: req.user.userId,
-      email: req.user.email,
-      firstName: req.user.firstName,
-      lastName: req.user.lastName
-    }
-  });
-});
-
-// Logout (invalidate token - client-side)
-app.post('/api/auth/logout', authenticateToken, (req, res) => {
-  res.json({
-    message: 'Logout successful',
-    note: 'Token should be removed from client storage'
-  });
-});
-
-// EXISTING ROUTES (keep all your existing trading routes)
-
 // Health check
-app.get('/api/health', (req, res) => {
-  res.json({ 
-    status: 'OK', 
-    message: 'Trading Journal API with Authentication is running!',
-    timestamp: new Date().toISOString()
+app.get("/api/health", (req, res) => {
+  res.json({
+    status: "OK",
+    message: "Trading Journal API is running with Supabase Auth!",
+    authMode: "Supabase Authentication",
+    timestamp: new Date().toISOString(),
   });
 });
 
 // Database status check
-app.get('/api/db-status', async (req, res) => {
+app.get("/api/db-status", async (req, res) => {
   try {
-    await pool.query('SELECT 1');
-    res.json({ 
-      connected: true, 
-      message: 'Database connected successfully',
-      timestamp: new Date().toISOString() 
+    const result = await pool.query("SELECT NOW() as current_time");
+    res.json({
+      connected: true,
+      message: "Database connected successfully",
+      authMode: "Supabase Authentication",
+      timestamp: new Date().toISOString(),
+      db_time: result.rows[0].current_time,
     });
   } catch (error) {
-    res.status(500).json({ 
-      connected: false, 
-      error: error.message 
+    console.error("Database status check failed:", error);
+    res.status(500).json({
+      connected: false,
+      error: error.message,
+      timestamp: new Date().toISOString(),
     });
   }
 });
 
-// Protected trading routes (require authentication)
-app.get('/api/trades', authenticateToken, async (req, res) => {
+// Get/Create user profile
+app.get("/api/auth/profile", authenticateSupabaseUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    // First try to get existing profile
+    const profileQuery = `
+      SELECT user_id, phone, trading_experience, preferred_market, risk_tolerance, created_at, updated_at
+      FROM user_profiles 
+      WHERE user_id = $1
+    `;
+
+    let result = await pool.query(profileQuery, [userId]);
+
+    // If no profile exists, create one
+    if (result.rows.length === 0) {
+      const createProfileQuery = `
+        INSERT INTO user_profiles (user_id)
+        VALUES ($1)
+        RETURNING user_id, phone, trading_experience, preferred_market, risk_tolerance, created_at, updated_at
+      `;
+
+      result = await pool.query(createProfileQuery, [userId]);
+    }
+
+    const profile = result.rows[0];
+
+    res.json({
+      user: {
+        id: req.user.id,
+        email: req.user.email,
+        firstName: req.user.first_name,
+        lastName: req.user.last_name,
+        phone: profile.phone,
+        tradingExperience: profile.trading_experience,
+        preferredMarket: profile.preferred_market,
+        riskTolerance: profile.risk_tolerance,
+        createdAt: profile.created_at,
+        updatedAt: profile.updated_at,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching profile:", error);
+    res.status(500).json({
+      error: "Failed to fetch profile",
+      message: error.message,
+    });
+  }
+});
+
+// Update user profile
+app.put("/api/auth/profile", authenticateSupabaseUser, async (req, res) => {
+  try {
+    const { error, value } = userProfileSchema.validate(req.body);
+    if (error) {
+      return res.status(400).json({
+        error: "Validation Error",
+        details: error.details.map((detail) => detail.message),
+      });
+    }
+
+    const userId = req.user.id;
+    const { phone, tradingExperience, preferredMarket, riskTolerance } = value;
+
+    const updateQuery = `
+      UPDATE user_profiles 
+      SET phone = COALESCE($2, phone),
+          trading_experience = COALESCE($3, trading_experience),
+          preferred_market = COALESCE($4, preferred_market),
+          risk_tolerance = COALESCE($5, risk_tolerance),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE user_id = $1
+      RETURNING *
+    `;
+
+    const result = await pool.query(updateQuery, [
+      userId,
+      phone,
+      tradingExperience,
+      preferredMarket,
+      riskTolerance,
+    ]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "Profile not found" });
+    }
+
+    const profile = result.rows[0];
+
+    res.json({
+      message: "Profile updated successfully",
+      user: {
+        id: req.user.id,
+        email: req.user.email,
+        phone: profile.phone,
+        tradingExperience: profile.trading_experience,
+        preferredMarket: profile.preferred_market,
+        riskTolerance: profile.risk_tolerance,
+        updatedAt: profile.updated_at,
+      },
+    });
+  } catch (error) {
+    console.error("Error updating profile:", error);
+    res.status(500).json({
+      error: "Failed to update profile",
+      message: error.message,
+    });
+  }
+});
+
+// Get trades
+app.get("/api/trades", authenticateSupabaseUser, async (req, res) => {
   try {
     const { status, strategy, limit = 1000 } = req.query;
-    const userEmail = req.user.email;
-    
+    const userId = req.user.id;
+
     let query = `
-      SELECT s_no, gmail, status, broker, market, instrument, direction, 
+      SELECT s_no, status, broker, market, instrument, direction, 
              qty, entry_price, exit_price, entry_dt, exit_dt, stoploss, 
-             commission, p_and_l, strategy, setup, reason
+             commission, p_and_l, strategy, setup, reason, created_at, updated_at
       FROM trading_journal 
-      WHERE gmail = $1
+      WHERE user_id = $1
     `;
-    const values = [userEmail];
+    const values = [userId];
     let paramCount = 1;
 
     if (status) {
@@ -611,63 +468,94 @@ app.get('/api/trades', authenticateToken, async (req, res) => {
     values.push(limit);
 
     const result = await pool.query(query, values);
-    
-    const trades = result.rows.map(row => ({
+
+    const trades = result.rows.map((row) => ({
       ...row,
       qty: parseFloat(row.qty),
       entry_price: parseFloat(row.entry_price),
       exit_price: row.exit_price ? parseFloat(row.exit_price) : null,
       stoploss: parseFloat(row.stoploss),
       commission: parseFloat(row.commission),
-      p_and_l: row.p_and_l ? parseFloat(row.p_and_l) : null
+      p_and_l: row.p_and_l ? parseFloat(row.p_and_l) : null,
     }));
 
     res.json({
       trades,
-      count: trades.length
+      count: trades.length,
     });
   } catch (error) {
-    console.error('Error fetching trades:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch trades',
-      message: error.message 
+    console.error("Error fetching trades:", error);
+    res.status(500).json({
+      error: "Failed to fetch trades",
+      message: error.message,
     });
   }
 });
 
-// Add new trade (protected)
-app.post('/api/trades', authenticateToken, async (req, res) => {
+// Add new trade
+app.post("/api/trades", authenticateSupabaseUser, async (req, res) => {
   try {
-    // Override gmail with authenticated user's email
-    const tradeData = { ...req.body, gmail: req.user.email };
-    
-    const { error, value } = tradeSchema.validate(tradeData);
+    const { error, value } = tradeSchema.validate(req.body);
     if (error) {
       return res.status(400).json({
-        error: 'Validation Error',
-        details: error.details.map(detail => detail.message)
+        error: "Validation Error",
+        details: error.details.map((detail) => detail.message),
       });
     }
 
+    const gmail = req.user.email;
+
     const {
-      gmail, status, broker, market, instrument, direction, qty,
-      entry_price, exit_price, entry_dt, exit_dt, stoploss, commission,
-      p_and_l, strategy, setup, reason
+      status,
+      broker,
+      market,
+      instrument,
+      direction,
+      qty,
+      entry_price,
+      exit_price,
+      entry_dt,
+      exit_dt,
+      stoploss,
+      commission,
+      p_and_l,
+      strategy,
+      setup,
+      reason,
     } = value;
 
+    const userId = req.user.id;
+
+    console.log({ userId });
+
     const query = `
-      INSERT INTO trading_journal (
-        gmail, status, broker, market, instrument, direction, qty, 
-        entry_price, exit_price, entry_dt, exit_dt, stoploss, 
-        commission, p_and_l, strategy, setup, reason
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-      RETURNING *
-    `;
+  INSERT INTO trading_journal (
+    user_id, status, broker, market, instrument, direction, qty, 
+    entry_price, exit_price, entry_dt, exit_dt, stoploss, 
+    commission, p_and_l, strategy, setup, reason, gmail
+  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+  RETURNING *
+`;
 
     const values = [
-      gmail, status, broker, market, instrument, direction, qty,
-      entry_price, exit_price || null, entry_dt, exit_dt || null,
-      stoploss, commission, p_and_l || null, strategy, setup || null, reason || null
+      userId,
+      status,
+      broker,
+      market,
+      instrument,
+      direction,
+      qty,
+      entry_price,
+      exit_price || null,
+      entry_dt,
+      exit_dt || null,
+      stoploss,
+      commission,
+      p_and_l || null,
+      strategy,
+      setup || null,
+      reason || null,
+      gmail,
     ];
 
     const result = await pool.query(query, values);
@@ -675,130 +563,157 @@ app.post('/api/trades', authenticateToken, async (req, res) => {
       ...result.rows[0],
       qty: parseFloat(result.rows[0].qty),
       entry_price: parseFloat(result.rows[0].entry_price),
-      exit_price: result.rows[0].exit_price ? parseFloat(result.rows[0].exit_price) : null,
+      exit_price: result.rows[0].exit_price
+        ? parseFloat(result.rows[0].exit_price)
+        : null,
       stoploss: parseFloat(result.rows[0].stoploss),
       commission: parseFloat(result.rows[0].commission),
-      p_and_l: result.rows[0].p_and_l ? parseFloat(result.rows[0].p_and_l) : null
+      p_and_l: result.rows[0].p_and_l
+        ? parseFloat(result.rows[0].p_and_l)
+        : null,
     };
 
     res.status(201).json({
-      message: 'Trade created successfully',
-      trade: savedTrade
+      message: "Trade created successfully",
+      trade: savedTrade,
     });
   } catch (error) {
-    console.error('Error creating trade:', error);
-    res.status(500).json({ 
-      error: 'Failed to create trade',
-      message: error.message 
+    console.error("Error creating trade:", error);
+    res.status(500).json({
+      error: "Failed to create trade",
+      message: error.message,
     });
   }
 });
 
-// Update existing trade (protected)
-app.put('/api/trades/:id', authenticateToken, async (req, res) => {
+// Update trade
+app.put("/api/trades/:id", authenticateSupabaseUser, async (req, res) => {
   try {
-    const { id } = req.params;
-    const tradeData = { ...req.body, s_no: parseInt(id), gmail: req.user.email };
+    const tradeId = req.params.id;
+    const userId = req.user.id;
 
-    const updateSchema = tradeSchema.keys({
-      s_no: Joi.number().integer().positive().required()
-    });
-    
-    const { error, value } = updateSchema.validate(tradeData);
+    const { error, value } = tradeSchema.validate(req.body);
     if (error) {
       return res.status(400).json({
-        error: 'Validation Error',
-        details: error.details.map(detail => detail.message)
+        error: "Validation Error",
+        details: error.details.map((detail) => detail.message),
       });
     }
 
     const {
-      gmail, status, broker, market, instrument, direction, qty,
-      entry_price, exit_price, entry_dt, exit_dt, stoploss, commission,
-      p_and_l, strategy, setup, reason
+      status,
+      broker,
+      market,
+      instrument,
+      direction,
+      qty,
+      entry_price,
+      exit_price,
+      entry_dt,
+      exit_dt,
+      stoploss,
+      commission,
+      p_and_l,
+      strategy,
+      setup,
+      reason,
     } = value;
 
     const query = `
-      UPDATE trading_journal SET
-        gmail = $1, status = $2, broker = $3, market = $4, instrument = $5,
-        direction = $6, qty = $7, entry_price = $8, exit_price = $9,
-        entry_dt = $10, exit_dt = $11, stoploss = $12, commission = $13,
-        p_and_l = $14, strategy = $15, setup = $16, reason = $17,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE s_no = $18 AND gmail = $19
+      UPDATE trading_journal 
+      SET status = $2, broker = $3, market = $4, instrument = $5, direction = $6, 
+          qty = $7, entry_price = $8, exit_price = $9, entry_dt = $10, exit_dt = $11, 
+          stoploss = $12, commission = $13, p_and_l = $14, strategy = $15, 
+          setup = $16, reason = $17, updated_at = CURRENT_TIMESTAMP
+      WHERE s_no = $1 AND user_id = $18
       RETURNING *
     `;
 
     const values = [
-      gmail, status, broker, market, instrument, direction, qty,
-      entry_price, exit_price || null, entry_dt, exit_dt || null,
-      stoploss, commission, p_and_l || null, strategy, setup || null, 
-      reason || null, id, gmail
+      tradeId,
+      status,
+      broker,
+      market,
+      instrument,
+      direction,
+      qty,
+      entry_price,
+      exit_price || null,
+      entry_dt,
+      exit_dt || null,
+      stoploss,
+      commission,
+      p_and_l || null,
+      strategy,
+      setup || null,
+      reason || null,
+      userId,
     ];
 
     const result = await pool.query(query, values);
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ 
-        error: 'Trade not found or access denied' 
-      });
+      return res.status(404).json({ error: "Trade not found or unauthorized" });
     }
 
     const updatedTrade = {
       ...result.rows[0],
       qty: parseFloat(result.rows[0].qty),
       entry_price: parseFloat(result.rows[0].entry_price),
-      exit_price: result.rows[0].exit_price ? parseFloat(result.rows[0].exit_price) : null,
+      exit_price: result.rows[0].exit_price
+        ? parseFloat(result.rows[0].exit_price)
+        : null,
       stoploss: parseFloat(result.rows[0].stoploss),
       commission: parseFloat(result.rows[0].commission),
-      p_and_l: result.rows[0].p_and_l ? parseFloat(result.rows[0].p_and_l) : null
+      p_and_l: result.rows[0].p_and_l
+        ? parseFloat(result.rows[0].p_and_l)
+        : null,
     };
 
     res.json({
-      message: 'Trade updated successfully',
-      trade: updatedTrade
+      message: "Trade updated successfully",
+      trade: updatedTrade,
     });
   } catch (error) {
-    console.error('Error updating trade:', error);
-    res.status(500).json({ 
-      error: 'Failed to update trade',
-      message: error.message 
+    console.error("Error updating trade:", error);
+    res.status(500).json({
+      error: "Failed to update trade",
+      message: error.message,
     });
   }
 });
 
-// Delete trade (protected)
-app.delete('/api/trades/:id', authenticateToken, async (req, res) => {
+// Delete trade
+app.delete("/api/trades/:id", authenticateSupabaseUser, async (req, res) => {
   try {
-    const { id } = req.params;
-    const userEmail = req.user.email;
-    
-    const query = 'DELETE FROM trading_journal WHERE s_no = $1 AND gmail = $2 RETURNING s_no';
-    const result = await pool.query(query, [id, userEmail]);
+    const tradeId = req.params.id;
+    const userId = req.user.id;
+
+    const query =
+      "DELETE FROM trading_journal WHERE s_no = $1 AND user_id = $2 RETURNING s_no";
+    const result = await pool.query(query, [tradeId, userId]);
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ 
-        error: 'Trade not found or access denied' 
-      });
+      return res.status(404).json({ error: "Trade not found or unauthorized" });
     }
 
     res.json({
-      message: 'Trade deleted successfully',
-      deletedId: result.rows[0].s_no
+      message: "Trade deleted successfully",
+      tradeId: result.rows[0].s_no,
     });
   } catch (error) {
-    console.error('Error deleting trade:', error);
-    res.status(500).json({ 
-      error: 'Failed to delete trade',
-      message: error.message 
+    console.error("Error deleting trade:", error);
+    res.status(500).json({
+      error: "Failed to delete trade",
+      message: error.message,
     });
   }
 });
 
-// Get trading statistics (protected)
-app.get('/api/analytics/stats', authenticateToken, async (req, res) => {
+// Get trading statistics
+app.get("/api/analytics/stats", authenticateSupabaseUser, async (req, res) => {
   try {
-    const userEmail = req.user.email;
+    const userId = req.user.id;
 
     const statsQuery = `
       SELECT 
@@ -812,15 +727,16 @@ app.get('/api/analytics/stats', authenticateToken, async (req, res) => {
         COALESCE(MAX(p_and_l), 0) as best_trade,
         COALESCE(MIN(p_and_l), 0) as worst_trade
       FROM trading_journal 
-      WHERE gmail = $1
+      WHERE user_id = $1
     `;
 
-    const result = await pool.query(statsQuery, [userEmail]);
+    const result = await pool.query(statsQuery, [userId]);
     const stats = result.rows[0];
 
-    const winRate = stats.closed_trades > 0 
-      ? ((stats.winning_trades / stats.closed_trades) * 100).toFixed(2)
-      : 0;
+    const winRate =
+      stats.closed_trades > 0
+        ? ((stats.winning_trades / stats.closed_trades) * 100).toFixed(2)
+        : 0;
 
     res.json({
       total_trades: parseInt(stats.total_trades),
@@ -832,305 +748,93 @@ app.get('/api/analytics/stats', authenticateToken, async (req, res) => {
       avg_pnl: parseFloat(stats.avg_pnl),
       best_trade: parseFloat(stats.best_trade),
       worst_trade: parseFloat(stats.worst_trade),
-      win_rate: parseFloat(winRate)
+      win_rate: parseFloat(winRate),
     });
   } catch (error) {
-    console.error('Error fetching stats:', error);
-    res.status(500).json({ 
-      error: 'Failed to fetch statistics',
-      message: error.message 
+    console.error("Error fetching stats:", error);
+    res.status(500).json({
+      error: "Failed to fetch statistics",
+      message: error.message,
     });
   }
 });
 
-// Get advanced trading statistics (protected)
-app.get('/api/analytics/advanced-stats', authenticateToken, async (req, res) => {
+// Supabase webhook endpoint for user creation
+app.post("/api/webhooks/supabase", async (req, res) => {
   try {
-    const userEmail = req.user.email;
+    const { type, record } = req.body;
 
-    const tradesQuery = `
-      SELECT * FROM trading_journal 
-      WHERE gmail = $1 
-      ORDER BY entry_dt ASC
-    `;
-    const tradesResult = await pool.query(tradesQuery, [userEmail]);
-    const trades = tradesResult.rows.map(row => ({
-      ...row,
-      qty: parseFloat(row.qty),
-      entry_price: parseFloat(row.entry_price),
-      exit_price: row.exit_price ? parseFloat(row.exit_price) : null,
-      stoploss: parseFloat(row.stoploss),
-      commission: parseFloat(row.commission),
-      p_and_l: row.p_and_l ? parseFloat(row.p_and_l) : null
-    }));
+    if (type === "INSERT" && record.email) {
+      // Create user profile when a new user signs up via Supabase Auth
+      const createProfileQuery = `
+        INSERT INTO user_profiles (user_id)
+        VALUES ($1)
+        ON CONFLICT (user_id) DO NOTHING
+      `;
 
-    const closedTrades = trades.filter(t => t.status === 'closed' && t.p_and_l !== null);
-    
-    if (closedTrades.length === 0) {
-      return res.json({
-        message: 'No closed trades available for analysis',
-        stats: null
-      });
+      await pool.query(createProfileQuery, [record.id]);
+      console.log(`Created profile for user: ${record.email}`);
     }
 
-    const totalTrades = trades.length;
-    const totalPnL = closedTrades.reduce((sum, t) => sum + t.p_and_l, 0);
-    const wins = closedTrades.filter(t => t.p_and_l > 0);
-    const losses = closedTrades.filter(t => t.p_and_l < 0);
-    
-    let cumulativePnL = 0;
-    const returns = [];
-    const cumulativePnLArray = [];
-    
-    closedTrades.forEach(trade => {
-      cumulativePnL += trade.p_and_l;
-      cumulativePnLArray.push(cumulativePnL);
-      
-      const tradeValue = trade.entry_price * trade.qty;
-      const returnPct = tradeValue > 0 ? (trade.p_and_l / tradeValue) : 0;
-      returns.push(returnPct);
-    });
-
-    const sharpeRatio = TradingAnalytics.calculateSharpeRatio(returns);
-    const maxDrawdown = TradingAnalytics.calculateMaxDrawdown(cumulativePnLArray);
-    const var95 = TradingAnalytics.calculateVaR(returns, 0.05);
-    const var99 = TradingAnalytics.calculateVaR(returns, 0.01);
-    const winRate = TradingAnalytics.calculateWinRate(trades);
-    const profitFactor = TradingAnalytics.calculateProfitFactor(trades);
-    const expectancy = TradingAnalytics.calculateExpectancy(trades);
-    
-    const avgWin = wins.length > 0 ? ss.mean(wins.map(t => t.p_and_l)) : 0;
-    const avgLoss = losses.length > 0 ? Math.abs(ss.mean(losses.map(t => t.p_and_l))) : 0;
-    const largestWin = wins.length > 0 ? Math.max(...wins.map(t => t.p_and_l)) : 0;
-    const largestLoss = losses.length > 0 ? Math.min(...losses.map(t => t.p_and_l)) : 0;
-    
-    const riskRewardRatio = avgLoss > 0 ? avgWin / avgLoss : 0;
-    const kelly = winRate > 0 && avgLoss > 0 ? ((winRate/100) * (avgWin/avgLoss) - ((100-winRate)/100)) / (avgWin/avgLoss) : 0;
-    
-    const firstTradeDate = new Date(closedTrades[0].entry_dt);
-    const lastTradeDate = new Date(closedTrades[closedTrades.length - 1].exit_dt);
-    const tradingDays = Math.ceil((lastTradeDate - firstTradeDate) / (1000 * 60 * 60 * 24));
-    const annualReturn = tradingDays > 0 ? (totalPnL / tradingDays) * 365 : 0;
-    const calmarRatio = TradingAnalytics.calculateCalmarRatio(annualReturn, maxDrawdown);
-
-    const stats = {
-      basic: {
-        totalTrades,
-        closedTrades: closedTrades.length,
-        openTrades: totalTrades - closedTrades.length,
-        totalPnL: parseFloat(totalPnL.toFixed(2)),
-        avgPnL: parseFloat((totalPnL / closedTrades.length).toFixed(2)),
-        winRate: parseFloat(winRate.toFixed(2)),
-        profitFactor: parseFloat(profitFactor.toFixed(2)),
-        expectancy: parseFloat(expectancy.toFixed(2))
-      },
-      risk: {
-        sharpeRatio: parseFloat(sharpeRatio.toFixed(3)),
-        maxDrawdown: parseFloat((maxDrawdown * 100).toFixed(2)),
-        calmarRatio: parseFloat(calmarRatio.toFixed(3)),
-        var95: parseFloat((var95 * 100).toFixed(2)),
-        var99: parseFloat((var99 * 100).toFixed(2)),
-        volatility: returns.length > 1 ? parseFloat((ss.standardDeviation(returns) * 100).toFixed(2)) : 0
-      },
-      performance: {
-        avgWin: parseFloat(avgWin.toFixed(2)),
-        avgLoss: parseFloat(Math.abs(avgLoss).toFixed(2)),
-        largestWin: parseFloat(largestWin.toFixed(2)),
-        largestLoss: parseFloat(largestLoss.toFixed(2)),
-        riskRewardRatio: parseFloat(riskRewardRatio.toFixed(2)),
-        kellyPercentage: parseFloat((kelly * 100).toFixed(2)),
-        annualReturn: parseFloat(annualReturn.toFixed(2))
-      },
-      time: {
-        firstTradeDate: firstTradeDate.toISOString(),
-        lastTradeDate: lastTradeDate.toISOString(),
-        tradingDays,
-        avgTradesPerMonth: parseFloat(((closedTrades.length / tradingDays) * 30).toFixed(1))
-      }
-    };
-
-    res.json({ stats });
+    res.json({ success: true });
   } catch (error) {
-    console.error('Error calculating advanced stats:', error);
-    res.status(500).json({ 
-      error: 'Failed to calculate advanced statistics',
-      message: error.message 
-    });
-  }
-});
-
-// Get pattern analysis (protected)
-app.get('/api/analytics/patterns', authenticateToken, async (req, res) => {
-  try {
-    const userEmail = req.user.email;
-
-    const tradesQuery = `
-      SELECT * FROM trading_journal 
-      WHERE gmail = $1 
-      ORDER BY entry_dt ASC
-    `;
-    const result = await pool.query(tradesQuery, [userEmail]);
-    const trades = result.rows.map(row => ({
-      ...row,
-      qty: parseFloat(row.qty),
-      entry_price: parseFloat(row.entry_price),
-      exit_price: row.exit_price ? parseFloat(row.exit_price) : null,
-      stoploss: parseFloat(row.stoploss),
-      commission: parseFloat(row.commission),
-      p_and_l: row.p_and_l ? parseFloat(row.p_and_l) : null
-    }));
-
-    const patterns = TradingAnalytics.detectPatterns(trades);
-
-    res.json({ patterns });
-  } catch (error) {
-    console.error('Error analyzing patterns:', error);
-    res.status(500).json({ 
-      error: 'Failed to analyze patterns',
-      message: error.message 
-    });
-  }
-});
-
-// Get time series data (protected)
-app.get('/api/analytics/time-series', authenticateToken, async (req, res) => {
-  try {
-    const { period = 'daily' } = req.query;
-    const userEmail = req.user.email;
-
-    const tradesQuery = `
-      SELECT * FROM trading_journal 
-      WHERE gmail = $1 AND status = 'closed' AND p_and_l IS NOT NULL
-      ORDER BY exit_dt ASC
-    `;
-    const result = await pool.query(tradesQuery, [userEmail]);
-    const trades = result.rows.map(row => ({
-      ...row,
-      p_and_l: parseFloat(row.p_and_l),
-      exit_dt: new Date(row.exit_dt)
-    }));
-
-    const timeSeriesData = {};
-    let cumulativePnL = 0;
-
-    trades.forEach(trade => {
-      let periodKey;
-      
-      switch (period) {
-        case 'hourly':
-          periodKey = trade.exit_dt.toISOString().slice(0, 13) + ':00:00.000Z';
-          break;
-        case 'daily':
-          periodKey = trade.exit_dt.toISOString().slice(0, 10);
-          break;
-        case 'weekly':
-          const weekStart = new Date(trade.exit_dt);
-          weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-          periodKey = weekStart.toISOString().slice(0, 10);
-          break;
-        case 'monthly':
-          periodKey = trade.exit_dt.toISOString().slice(0, 7);
-          break;
-        default:
-          periodKey = trade.exit_dt.toISOString().slice(0, 10);
-      }
-
-      if (!timeSeriesData[periodKey]) {
-        timeSeriesData[periodKey] = {
-          period: periodKey,
-          trades: 0,
-          totalPnL: 0,
-          wins: 0,
-          losses: 0,
-          volume: 0
-        };
-      }
-
-      timeSeriesData[periodKey].trades++;
-      timeSeriesData[periodKey].totalPnL += trade.p_and_l;
-      timeSeriesData[periodKey].volume += trade.qty * trade.entry_price;
-      
-      if (trade.p_and_l > 0) {
-        timeSeriesData[periodKey].wins++;
-      } else {
-        timeSeriesData[periodKey].losses++;
-      }
-    });
-
-    const timeSeriesArray = Object.values(timeSeriesData)
-      .sort((a, b) => new Date(a.period) - new Date(b.period))
-      .map(data => {
-        cumulativePnL += data.totalPnL;
-        return {
-          ...data,
-          cumulativePnL: parseFloat(cumulativePnL.toFixed(2)),
-          winRate: data.trades > 0 ? parseFloat(((data.wins / data.trades) * 100).toFixed(2)) : 0,
-          avgPnL: data.trades > 0 ? parseFloat((data.totalPnL / data.trades).toFixed(2)) : 0
-        };
-      });
-
-    res.json({ 
-      period,
-      data: timeSeriesArray 
-    });
-  } catch (error) {
-    console.error('Error generating time series:', error);
-    res.status(500).json({ 
-      error: 'Failed to generate time series data',
-      message: error.message 
-    });
+    console.error("Webhook error:", error);
+    res.status(500).json({ error: "Webhook processing failed" });
   }
 });
 
 // Error handling middleware
 app.use((err, req, res, next) => {
-  console.error(err.stack);
+  console.error("Server Error:", err.stack);
   res.status(500).json({
-    error: 'Something went wrong!',
-    message: err.message
-  });
-});
-
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ 
-    error: 'Not Found',
-    message: 'The requested endpoint does not exist' 
+    error: "Internal Server Error",
+    message:
+      process.env.NODE_ENV === "development"
+        ? err.message
+        : "Something went wrong!",
   });
 });
 
 // Start server
 const startServer = async () => {
   try {
+    console.log("Testing database connection...");
+    await pool.query("SELECT 1");
+    console.log("✅ Database connection successful");
+
+    console.log("Testing Supabase connection...");
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers();
+    if (error) {
+      throw new Error(`Supabase connection failed: ${error.message}`);
+    }
+    console.log("✅ Supabase connection successful");
+
     await initializeDatabase();
+
     app.listen(PORT, () => {
-      console.log(`🚀 Trading Journal API with Authentication running on port ${PORT}`);
-      console.log(`📊 Health check: http://localhost:${PORT}/api/health`);
-      console.log(`🔐 Authentication Endpoints:`);
-      console.log(`   - Sign Up: POST http://localhost:${PORT}/api/auth/signup`);
-      console.log(`   - Sign In: POST http://localhost:${PORT}/api/auth/signin`);
-      console.log(`   - Profile: GET http://localhost:${PORT}/api/auth/profile`);
-      console.log(`📈 Protected Analytics Endpoints:`);
-      console.log(`   - Stats: GET http://localhost:${PORT}/api/analytics/stats`);
-      console.log(`   - Advanced Stats: GET http://localhost:${PORT}/api/analytics/advanced-stats`);
-      console.log(`   - Patterns: GET http://localhost:${PORT}/api/analytics/patterns`);
-      console.log(`   - Time Series: GET http://localhost:${PORT}/api/analytics/time-series`);
+      console.log(`🚀 Server running on: http://localhost:${PORT}`);
+      console.log(`🩺 Health check: http://localhost:${PORT}/api/health`);
+      console.log(`💾 DB status: http://localhost:${PORT}/api/db-status`);
+      console.log("✅ Server ready with Supabase authentication!");
     });
   } catch (error) {
-    console.error('Failed to start server:', error);
+    console.error("❌ Failed to start server:", error.message);
+    console.error(
+      "Please ensure your Supabase configuration is correct and try again."
+    );
     process.exit(1);
   }
 };
 
 // Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('Shutting down gracefully...');
+process.on("SIGTERM", async () => {
+  console.log("Shutting down gracefully...");
   await pool.end();
   process.exit(0);
 });
 
-process.on('SIGINT', async () => {
-  console.log('Shutting down gracefully...');
+process.on("SIGINT", async () => {
+  console.log("Shutting down gracefully...");
   await pool.end();
   process.exit(0);
 });
