@@ -25,7 +25,7 @@
     "nodemon": "^3.1.10",
     "ts-node": "^10.9.1",
     "typescript": "^5.3.0"
-  }
+  },
   "scripts": {
   "start": "node server.js",
   "dev": "nodemon server.js"
