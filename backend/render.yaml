@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: trading-journal-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: ./start.sh
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3001
