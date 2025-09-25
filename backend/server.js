@@ -44,11 +44,18 @@ try {
     auth: {
       autoRefreshToken: false,
       persistSession: false
+    },
+    db: {
+      schema: 'public'
     }
   });
   
   // Regular client (respects RLS, for user operations)
-  supabase = createClient(supabaseUrl, supabaseAnonKey);
+  supabase = createClient(supabaseUrl, supabaseAnonKey, {
+    db: {
+      schema: 'public'
+    }
+  });
   
   console.log('✅ Supabase clients initialized successfully');
 } catch (error) {
@@ -199,6 +206,9 @@ const authenticateSupabaseUser = async (req, res, next) => {
         headers: {
           Authorization: `Bearer ${token}`
         }
+      },
+      db: {
+        schema: 'public'
       }
     });
 
@@ -443,6 +453,7 @@ const initializeDatabase = async () => {
 
     console.log('✅ Database initialization completed successfully');
     console.log('🔒 Security: Authentication Middleware + RLS (where supported)');
+    console.log('ℹ️ Note: Supabase API queries will use PostgreSQL fallback due to schema configuration');
   } catch (error) {
     console.error('❌ Database initialization error:', error);
     throw error;
@@ -475,7 +486,8 @@ app.get('/api/db-status', async (req, res) => {
       postgresConnected: true,
       supabaseConnected: !error,
       dbTime: pgResult.rows[0].current_time,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      note: 'Using PostgreSQL fallback for data queries due to Supabase API schema configuration'
     });
   } catch (error) {
     console.error('Database status check failed:', error);
@@ -487,52 +499,28 @@ app.get('/api/db-status', async (req, res) => {
   }
 });
 
-// Get/Create user profile
+// Get/Create user profile - POSTGRESQL ONLY (more reliable)
 app.get('/api/auth/profile', authenticateSupabaseUser, async (req, res) => {
   try {
     const userId = req.user.id;
     
-    // Try Supabase client first (with RLS)
-    let { data: profile, error } = await req.supabase
-      .from('user_profiles')
-      .select('*')
-      .eq('user_id', userId)
-      .single();
+    console.log('ℹ️ Using PostgreSQL for profile query (more reliable)');
     
-    // If no profile exists, create one
-    if (error && error.code === 'PGRST116') {
-      const { data: newProfile, error: insertError } = await req.supabase
-        .from('user_profiles')
-        .insert([{ user_id: userId }])
-        .select()
-        .single();
-
-      if (insertError) {
-        // Fallback to PostgreSQL
-        const result = await pool.query(
-          'INSERT INTO user_profiles (user_id) VALUES ($1) RETURNING *',
-          [userId]
-        );
-        profile = result.rows[0];
-      } else {
-        profile = newProfile;
-      }
-    } else if (error) {
-      // Fallback to PostgreSQL
-      const result = await pool.query(
-        'SELECT * FROM user_profiles WHERE user_id = $1',
+    // Use PostgreSQL directly (more reliable than Supabase client for this use case)
+    let result = await pool.query(
+      'SELECT * FROM user_profiles WHERE user_id = $1',
+      [userId]
+    );
+    
+    let profile;
+    if (result.rows.length === 0) {
+      const insertResult = await pool.query(
+        'INSERT INTO user_profiles (user_id) VALUES ($1) RETURNING *',
         [userId]
       );
-      
-      if (result.rows.length === 0) {
-        const insertResult = await pool.query(
-          'INSERT INTO user_profiles (user_id) VALUES ($1) RETURNING *',
-          [userId]
-        );
-        profile = insertResult.rows[0];
-      } else {
-        profile = result.rows[0];
-      }
+      profile = insertResult.rows[0];
+    } else {
+      profile = result.rows[0];
     }
 
     res.json({
@@ -558,7 +546,7 @@ app.get('/api/auth/profile', authenticateSupabaseUser, async (req, res) => {
   }
 });
 
-// Update user profile
+// Update user profile - POSTGRESQL ONLY (more reliable)
 app.put('/api/auth/profile', authenticateSupabaseUser, async (req, res) => {
   try {
     const { error: validationError, value } = userProfileSchema.validate(req.body);
@@ -580,30 +568,22 @@ app.put('/api/auth/profile', authenticateSupabaseUser, async (req, res) => {
       updateData[key] === undefined && delete updateData[key]
     );
 
-    // Try Supabase client first
-    let { data: profile, error } = await req.supabase
-      .from('user_profiles')
-      .update(updateData)
-      .eq('user_id', userId)
-      .select()
-      .single();
-
-    if (error) {
-      // Fallback to PostgreSQL
-      const updateColumns = Object.keys(updateData);
-      const setClause = updateColumns.map((col, index) => `${col} = $${index + 2}`).join(', ');
-      const values = [userId, ...updateColumns.map(col => updateData[col])];
-      
-      const result = await pool.query(
-        `UPDATE user_profiles SET ${setClause} WHERE user_id = $1 RETURNING *`,
-        values
-      );
-      
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'Profile not found' });
-      }
-      profile = result.rows[0];
+    console.log('ℹ️ Using PostgreSQL for profile update (more reliable)');
+    
+    // Use PostgreSQL directly
+    const updateColumns = Object.keys(updateData);
+    const setClause = updateColumns.map((col, index) => `${col} = $${index + 2}`).join(', ');
+    const values = [userId, ...updateColumns.map(col => updateData[col])];
+    
+    const result = await pool.query(
+      `UPDATE user_profiles SET ${setClause} WHERE user_id = $1 RETURNING *`,
+      values
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Profile not found' });
     }
+    const profile = result.rows[0];
 
     res.json({
       message: 'Profile updated successfully',
@@ -626,55 +606,36 @@ app.put('/api/auth/profile', authenticateSupabaseUser, async (req, res) => {
   }
 });
 
-// Get trades - WITH PROPER NUMBER FORMATTING
+// Get trades - POSTGRESQL ONLY (more reliable)
 app.get('/api/trades', authenticateSupabaseUser, async (req, res) => {
   try {
     const { status, strategy, limit = 1000 } = req.query;
     const userId = req.user.id;
     
-    // Try Supabase client first (with RLS)
-    let query = req.supabase
-      .from('trading_journal')
-      .select('*')
-      .order('s_no', { ascending: false })
-      .limit(parseInt(limit));
+    console.log('ℹ️ Using PostgreSQL for trades query (more reliable)');
+    
+    // Use PostgreSQL directly with manual user filtering
+    let pgQuery = 'SELECT * FROM trading_journal WHERE user_id = $1';
+    const values = [userId];
+    let paramCount = 1;
 
     if (status) {
-      query = query.eq('status', status);
+      paramCount++;
+      pgQuery += ` AND status = $${paramCount}`;
+      values.push(status);
     }
 
     if (strategy) {
-      query = query.eq('strategy', strategy);
+      paramCount++;
+      pgQuery += ` AND strategy = $${paramCount}`;
+      values.push(strategy);
     }
 
-    let { data: trades, error } = await query;
+    pgQuery += ` ORDER BY s_no DESC LIMIT $${paramCount + 1}`;
+    values.push(parseInt(limit));
 
-    if (error) {
-      console.log('Supabase query failed, using PostgreSQL fallback:', error.message);
-      
-      // Fallback to PostgreSQL with manual user filtering
-      let pgQuery = 'SELECT * FROM trading_journal WHERE user_id = $1';
-      const values = [userId];
-      let paramCount = 1;
-
-      if (status) {
-        paramCount++;
-        pgQuery += ` AND status = $${paramCount}`;
-        values.push(status);
-      }
-
-      if (strategy) {
-        paramCount++;
-        pgQuery += ` AND strategy = $${paramCount}`;
-        values.push(strategy);
-      }
-
-      pgQuery += ` ORDER BY s_no DESC LIMIT $${paramCount + 1}`;
-      values.push(parseInt(limit));
-
-      const result = await pool.query(pgQuery, values);
-      trades = result.rows;
-    }
+    const result = await pool.query(pgQuery, values);
+    const trades = result.rows;
 
     // Format trades data - convert strings to numbers
     const formattedTrades = formatTradesData(trades || []);
@@ -692,7 +653,7 @@ app.get('/api/trades', authenticateSupabaseUser, async (req, res) => {
   }
 });
 
-// Add new trade - WITH PROPER NUMBER FORMATTING
+// Add new trade - POSTGRESQL ONLY (more reliable)
 app.post('/api/trades', authenticateSupabaseUser, async (req, res) => {
   try {
     const { error: validationError, value } = tradeSchema.validate(req.body);
@@ -725,51 +686,42 @@ app.post('/api/trades', authenticateSupabaseUser, async (req, res) => {
       updated_at: new Date().toISOString()
     };
 
-    // Try Supabase client first
-    let { data: trade, error } = await req.supabase
-      .from('trading_journal')
-      .insert([tradeData])
-      .select()
-      .single();
+    console.log('ℹ️ Using PostgreSQL for trade insert (more reliable)');
+    
+    // PostgreSQL with exact column mapping
+    const result = await pool.query(`
+      INSERT INTO trading_journal (
+        user_id, status, broker, market, instrument, direction,
+        qty, entry_price, exit_price, entry_dt, exit_dt,
+        stoploss, commission, p_and_l, strategy, setup, reason,
+        created_at, updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+      ) RETURNING *
+    `, [
+      tradeData.user_id,
+      tradeData.status,
+      tradeData.broker,
+      tradeData.market,
+      tradeData.instrument,
+      tradeData.direction,
+      tradeData.qty,
+      tradeData.entry_price,
+      tradeData.exit_price,
+      tradeData.entry_dt,
+      tradeData.exit_dt,
+      tradeData.stoploss,
+      tradeData.commission,
+      tradeData.p_and_l,
+      tradeData.strategy,
+      tradeData.setup,
+      tradeData.reason,
+      tradeData.created_at,
+      tradeData.updated_at
+    ]);
 
-    if (error) {
-      console.log('Supabase insert failed, using PostgreSQL fallback:', error.message);
-      
-      // PostgreSQL fallback with exact column mapping
-      const result = await pool.query(`
-        INSERT INTO trading_journal (
-          user_id, status, broker, market, instrument, direction,
-          qty, entry_price, exit_price, entry_dt, exit_dt,
-          stoploss, commission, p_and_l, strategy, setup, reason,
-          created_at, updated_at
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
-        ) RETURNING *
-      `, [
-        tradeData.user_id,
-        tradeData.status,
-        tradeData.broker,
-        tradeData.market,
-        tradeData.instrument,
-        tradeData.direction,
-        tradeData.qty,
-        tradeData.entry_price,
-        tradeData.exit_price,
-        tradeData.entry_dt,
-        tradeData.exit_dt,
-        tradeData.stoploss,
-        tradeData.commission,
-        tradeData.p_and_l,
-        tradeData.strategy,
-        tradeData.setup,
-        tradeData.reason,
-        tradeData.created_at,
-        tradeData.updated_at
-      ]);
-
-      trade = result.rows[0];
-      console.log('PostgreSQL insert successful!');
-    }
+    const trade = result.rows[0];
+    console.log('✅ PostgreSQL insert successful!');
 
     // Format the response data
     const formattedTrade = formatTradeData(trade);
@@ -787,7 +739,7 @@ app.post('/api/trades', authenticateSupabaseUser, async (req, res) => {
   }
 });
 
-// Update trade - WITH PROPER NUMBER FORMATTING
+// Update trade - POSTGRESQL ONLY (more reliable)
 app.put('/api/trades/:id', authenticateSupabaseUser, async (req, res) => {
   try {
     const tradeId = req.params.id;
@@ -806,39 +758,29 @@ app.put('/api/trades/:id', authenticateSupabaseUser, async (req, res) => {
       updated_at: new Date().toISOString()
     };
 
-    // Try Supabase client first
-    let { data: trade, error } = await req.supabase
-      .from('trading_journal')
-      .update(updateData)
-      .eq('s_no', tradeId)
-      .select()
-      .single();
-
-    if (error) {
-      console.log('Supabase update failed, using PostgreSQL fallback:', error.message);
-      
-      // PostgreSQL fallback
-      const result = await pool.query(`
-        UPDATE trading_journal SET
-          status = $3, broker = $4, market = $5, instrument = $6, direction = $7,
-          qty = $8, entry_price = $9, exit_price = $10, entry_dt = $11, exit_dt = $12,
-          stoploss = $13, commission = $14, p_and_l = $15, strategy = $16,
-          setup = $17, reason = $18, updated_at = $19
-        WHERE s_no = $1 AND user_id = $2
-        RETURNING *
-      `, [
-        tradeId, userId, updateData.status, updateData.broker, updateData.market,
-        updateData.instrument, updateData.direction, updateData.qty, updateData.entry_price,
-        updateData.exit_price, updateData.entry_dt, updateData.exit_dt, updateData.stoploss,
-        updateData.commission, updateData.p_and_l, updateData.strategy, updateData.setup,
-        updateData.reason, updateData.updated_at
-      ]);
-      
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'Trade not found or unauthorized' });
-      }
-      trade = result.rows[0];
+    console.log('ℹ️ Using PostgreSQL for trade update (more reliable)');
+    
+    // PostgreSQL update
+    const result = await pool.query(`
+      UPDATE trading_journal SET
+        status = $3, broker = $4, market = $5, instrument = $6, direction = $7,
+        qty = $8, entry_price = $9, exit_price = $10, entry_dt = $11, exit_dt = $12,
+        stoploss = $13, commission = $14, p_and_l = $15, strategy = $16,
+        setup = $17, reason = $18, updated_at = $19
+      WHERE s_no = $1 AND user_id = $2
+      RETURNING *
+    `, [
+      tradeId, userId, updateData.status, updateData.broker, updateData.market,
+      updateData.instrument, updateData.direction, updateData.qty, updateData.entry_price,
+      updateData.exit_price, updateData.entry_dt, updateData.exit_dt, updateData.stoploss,
+      updateData.commission, updateData.p_and_l, updateData.strategy, updateData.setup,
+      updateData.reason, updateData.updated_at
+    ]);
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Trade not found or unauthorized' });
     }
+    const trade = result.rows[0];
 
     // Format the response data
     const formattedTrade = formatTradeData(trade);
@@ -856,34 +798,24 @@ app.put('/api/trades/:id', authenticateSupabaseUser, async (req, res) => {
   }
 });
 
-// Delete trade
+// Delete trade - POSTGRESQL ONLY (more reliable)
 app.delete('/api/trades/:id', authenticateSupabaseUser, async (req, res) => {
   try {
     const tradeId = req.params.id;
     const userId = req.user.id;
 
-    // Try Supabase client first
-    let { data: trade, error } = await req.supabase
-      .from('trading_journal')
-      .delete()
-      .eq('s_no', tradeId)
-      .select('s_no')
-      .single();
-
-    if (error) {
-      console.log('Supabase delete failed, using PostgreSQL fallback:', error.message);
-      
-      // PostgreSQL fallback
-      const result = await pool.query(
-        'DELETE FROM trading_journal WHERE s_no = $1 AND user_id = $2 RETURNING s_no',
-        [tradeId, userId]
-      );
-      
-      if (result.rows.length === 0) {
-        return res.status(404).json({ error: 'Trade not found or unauthorized' });
-      }
-      trade = result.rows[0];
+    console.log('ℹ️ Using PostgreSQL for trade delete (more reliable)');
+    
+    // PostgreSQL delete
+    const result = await pool.query(
+      'DELETE FROM trading_journal WHERE s_no = $1 AND user_id = $2 RETURNING s_no',
+      [tradeId, userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Trade not found or unauthorized' });
     }
+    const trade = result.rows[0];
 
     res.json({
       message: 'Trade deleted successfully',
@@ -898,26 +830,19 @@ app.delete('/api/trades/:id', authenticateSupabaseUser, async (req, res) => {
   }
 });
 
-// Get trading statistics - WITH PROPER NUMBER FORMATTING
+// Get trading statistics - POSTGRESQL ONLY (more reliable)
 app.get('/api/analytics/stats', authenticateSupabaseUser, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Try Supabase client first
-    let { data: trades, error } = await req.supabase
-      .from('trading_journal')
-      .select('status, p_and_l');
-
-    if (error) {
-      console.log('Supabase stats query failed, using PostgreSQL fallback:', error.message);
-      
-      // PostgreSQL fallback
-      const result = await pool.query(
-        'SELECT status, p_and_l FROM trading_journal WHERE user_id = $1',
-        [userId]
-      );
-      trades = result.rows;
-    }
+    console.log('ℹ️ Using PostgreSQL for stats query (more reliable)');
+    
+    // PostgreSQL query
+    const result = await pool.query(
+      'SELECT status, p_and_l FROM trading_journal WHERE user_id = $1',
+      [userId]
+    );
+    const trades = result.rows;
 
     const totalTrades = trades.length;
     const openTrades = trades.filter(t => t.status === 'open').length;
@@ -957,24 +882,19 @@ app.get('/api/analytics/stats', authenticateSupabaseUser, async (req, res) => {
   }
 });
 
-// Advanced Analytics Endpoints
+// Advanced Analytics Endpoints - POSTGRESQL ONLY (more reliable)
 app.get('/api/analytics/advanced-stats', authenticateSupabaseUser, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Get all trades for the user
-    let { data: trades, error } = await req.supabase
-      .from('trading_journal')
-      .select('*');
-
-    if (error) {
-      console.log('Supabase advanced stats query failed, using PostgreSQL fallback:', error.message);
-      const result = await pool.query(
-        'SELECT * FROM trading_journal WHERE user_id = $1 ORDER BY entry_dt',
-        [userId]
-      );
-      trades = result.rows;
-    }
+    console.log('ℹ️ Using PostgreSQL for advanced stats query (more reliable)');
+    
+    // Get all trades for the user using PostgreSQL
+    const result = await pool.query(
+      'SELECT * FROM trading_journal WHERE user_id = $1 ORDER BY entry_dt',
+      [userId]
+    );
+    const trades = result.rows;
 
     if (!trades || trades.length === 0) {
       return res.json({
@@ -1161,26 +1081,20 @@ app.get('/api/analytics/advanced-stats', authenticateSupabaseUser, async (req, r
   }
 });
 
-// Time series data endpoint
+// Time series data endpoint - POSTGRESQL ONLY (more reliable)
 app.get('/api/analytics/time-series', authenticateSupabaseUser, async (req, res) => {
   try {
     const userId = req.user.id;
     const { period = 'daily' } = req.query;
 
-    // Get all trades for the user
-    let { data: trades, error } = await req.supabase
-      .from('trading_journal')
-      .select('*')
-      .order('entry_dt', { ascending: true });
-
-    if (error) {
-      console.log('Supabase time-series query failed, using PostgreSQL fallback:', error.message);
-      const result = await pool.query(
-        'SELECT * FROM trading_journal WHERE user_id = $1 ORDER BY entry_dt',
-        [userId]
-      );
-      trades = result.rows;
-    }
+    console.log('ℹ️ Using PostgreSQL for time-series query (more reliable)');
+    
+    // Get all trades for the user using PostgreSQL
+    const result = await pool.query(
+      'SELECT * FROM trading_journal WHERE user_id = $1 ORDER BY entry_dt',
+      [userId]
+    );
+    const trades = result.rows;
 
     if (!trades || trades.length === 0) {
       return res.json({ data: [] });
@@ -1262,25 +1176,19 @@ app.get('/api/analytics/time-series', authenticateSupabaseUser, async (req, res)
   }
 });
 
-// Patterns analysis endpoint
+// Patterns analysis endpoint - POSTGRESQL ONLY (more reliable)
 app.get('/api/analytics/patterns', authenticateSupabaseUser, async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // Get all trades for the user
-    let { data: trades, error } = await req.supabase
-      .from('trading_journal')
-      .select('*')
-      .order('entry_dt', { ascending: true });
-
-    if (error) {
-      console.log('Supabase patterns query failed, using PostgreSQL fallback:', error.message);
-      const result = await pool.query(
-        'SELECT * FROM trading_journal WHERE user_id = $1 ORDER BY entry_dt',
-        [userId]
-      );
-      trades = result.rows;
-    }
+    console.log('ℹ️ Using PostgreSQL for patterns query (more reliable)');
+    
+    // Get all trades for the user using PostgreSQL
+    const result = await pool.query(
+      'SELECT * FROM trading_journal WHERE user_id = $1 ORDER BY entry_dt',
+      [userId]
+    );
+    const trades = result.rows;
 
     if (!trades || trades.length === 0) {
       return res.json({
@@ -1394,22 +1302,16 @@ app.post('/api/webhooks/supabase', async (req, res) => {
     
     if (type === 'INSERT' && record.email) {
       // Create user profile when a new user signs up via Supabase Auth
-      const { error } = await supabaseAdmin
-        .from('user_profiles')
-        .insert([{ user_id: record.id }]);
-      
-      if (error && error.code !== '23505') {
-        // Fallback to PostgreSQL
-        try {
-          await pool.query(
-            'INSERT INTO user_profiles (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING',
-            [record.id]
-          );
-        } catch (pgError) {
-          console.error('Webhook profile creation failed:', pgError);
-        }
+      // Use PostgreSQL for reliability
+      try {
+        await pool.query(
+          'INSERT INTO user_profiles (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING',
+          [record.id]
+        );
+        console.log(`✅ Created profile for user: ${record.email}`);
+      } catch (pgError) {
+        console.error('Webhook profile creation failed:', pgError);
       }
-      console.log(`Created profile for user: ${record.email}`);
     }
     
     res.json({ success: true });
@@ -1444,9 +1346,10 @@ const startServer = async () => {
       console.log(`🚀 Server running on: http://localhost:${PORT}`);
       console.log(`🩺 Health check: http://localhost:${PORT}/api/health`);
       console.log(`💾 DB status: http://localhost:${PORT}/api/db-status`);
-      console.log('✅ Server ready with Supabase authentication + RLS!');
-      console.log('🔒 Security: Middleware + Row Level Security + PostgreSQL Fallback');
+      console.log('✅ Server ready with Supabase authentication!');
+      console.log('🔒 Security: Authentication + PostgreSQL Direct Access (Reliable)');
       console.log('🔢 Data Formatting: Automatic number conversion for frontend compatibility');
+      console.log('ℹ️ Note: Using PostgreSQL direct access for better reliability');
     });
     
   } catch (error) {
